@@ -1,0 +1,180 @@
+# FFT autograder — POSTs the student's kernels.py + twiddles.py to the
+# Modal grader endpoint and posts the grade as a commit comment.
+#
+# This workflow lives in a GitHub Classroom assignment template. When a
+# student accepts the assignment, Classroom creates a fresh private repo
+# from this template; the workflow runs on every push to main against
+# THAT student's repo, with secrets inherited from the Classroom.
+#
+# Submission cap: 40 graded runs per repo (= per student). We count past
+# commit comments tagged with the marker below. The cap is per-Classroom-
+# repo: a fresh accept gives a fresh count.
+#
+# Required secrets (set at the Classroom level so they propagate to every
+# student repo):
+#   MODAL_GRADER_URL   — deployed endpoint, e.g. https://bigpseud--fft-grade.modal.run
+#   MODAL_AUTH_TOKEN   — matches the AUTH_TOKEN in the Modal secret
+#                        fft-autograder-token
+
+name: FFT autograder
+
+on:
+  push:
+    branches: [main]
+    paths:
+      # Trigger on kernels.py only — students iterate on twiddles.py freely
+      # without burning submission attempts. The grader still fetches both
+      # files at the triggered SHA.
+      - kernels.py
+  # Manual trigger for the instructor or the student to re-run after a
+  # pure-twiddles push, or to retry without pushing a no-op commit.
+  workflow_dispatch:
+
+permissions:
+  contents: write    # required to post commit comments
+
+concurrency:
+  group: fft-grader-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  grade:
+    runs-on: ubuntu-latest
+    env:
+      MARKER: "<!-- fft-autograder-result -->"
+      CAP_MARKER: "<!-- fft-autograder-cap -->"
+      MAX_SUBMISSIONS: 40
+      REPO: ${{ github.repository }}
+      SHA: ${{ github.sha }}
+
+    steps:
+      - name: Count past graded submissions
+        id: cap
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Count past commit comments tagged with our result marker.
+          # Each grader run posts exactly one such comment, so the count
+          # equals the number of completed graded submissions.
+          count=$(gh api "/repos/$REPO/comments" --paginate \
+            --jq "[.[] | select(.body | contains(\"$MARKER\"))] | length" \
+            | awk '{ s += $1 } END { print s+0 }')
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether to grade
+        id: gate
+        run: |
+          if [ "${{ steps.cap.outputs.count }}" -ge "$MAX_SUBMISSIONS" ]; then
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Comment that submission cap is reached
+        if: steps.gate.outputs.go == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Post the cap message at most once per repo.
+          existing=$(gh api "/repos/$REPO/comments" --paginate \
+            --jq "[.[] | select(.body | contains(\"$CAP_MARKER\"))] | length" \
+            | awk '{ s += $1 } END { print s+0 }')
+          if [ "$existing" = "0" ]; then
+            cat > /tmp/cap_body.md <<EOF
+          $MARKER
+          $CAP_MARKER
+          ## FFT autograder
+
+          Submission cap reached ($MAX_SUBMISSIONS / $MAX_SUBMISSIONS).
+
+          You've used all of your graded runs on this assignment. If you
+          believe an additional attempt is warranted, contact the
+          instructor — they can grant manual extensions.
+          EOF
+            jq -n --rawfile body /tmp/cap_body.md '{body: $body}' > /tmp/cap_payload.json
+            gh api -X POST "/repos/$REPO/commits/$SHA/comments" \
+              --input /tmp/cap_payload.json
+          fi
+
+      - name: Fetch student kernels.py and twiddles.py
+        if: steps.gate.outputs.go == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "/repos/$REPO/contents/kernels.py?ref=$SHA" \
+            --jq '.content' | base64 -d > /tmp/student_kernels.py
+          gh api "/repos/$REPO/contents/twiddles.py?ref=$SHA" \
+            --jq '.content' | base64 -d > /tmp/student_twiddles.py
+          test -s /tmp/student_kernels.py
+          test -s /tmp/student_twiddles.py
+          echo "Fetched kernels.py: $(wc -l < /tmp/student_kernels.py) lines."
+          echo "Fetched twiddles.py: $(wc -l < /tmp/student_twiddles.py) lines."
+
+      - name: Submit to Modal grader
+        if: steps.gate.outputs.go == 'true'
+        env:
+          MODAL_URL: ${{ secrets.MODAL_GRADER_URL }}
+          MODAL_TOKEN: ${{ secrets.MODAL_AUTH_TOKEN }}
+        run: |
+          jq -Rs --rawfile twiddles /tmp/student_twiddles.py \
+            '{kernels_py: ., twiddles_py: $twiddles}' \
+            /tmp/student_kernels.py > /tmp/payload.json
+          http_code=$(curl -sS -o /tmp/grade.json -w "%{http_code}" \
+            -X POST "$MODAL_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Auth-Token: $MODAL_TOKEN" \
+            --max-time 600 \
+            -d @/tmp/payload.json)
+          if [ "$http_code" != "200" ]; then
+            echo "::error::Modal grader returned HTTP $http_code"
+            cat /tmp/grade.json || true
+            exit 1
+          fi
+
+      - name: Post grade as commit comment
+        if: steps.gate.outputs.go == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          remaining=$((MAX_SUBMISSIONS - ${{ steps.cap.outputs.count }} - 1))
+          grade=$(jq -r '.grade // "?"' /tmp/grade.json)
+          passed=$(jq -r '.rungs_passed // 0' /tmp/grade.json)
+          summary=$(jq -r '
+            (.rungs // {}) | to_entries | map(
+              "- **" + .key + "**: " +
+              (if .value.passed then "PASS" else "FAIL" end) +
+              (if (.value.perf // null) and (.value.perf.geomean_ratio // null) != null
+                then "  ·  perf geomean " + ((.value.perf.geomean_ratio * 1000 | round) / 1000 | tostring)
+                else "" end) +
+              (if (.value.bitwise_equal_f6 // null) != null
+                then "  ·  F7==F6: " + (if .value.bitwise_equal_f6 then "yes" else "no" end)
+                else "" end) +
+              (if .value.reason and (.value.passed | not)
+                then "  —  " + .value.reason
+                else "" end)
+            ) | join("\n")
+          ' /tmp/grade.json)
+
+          {
+            echo "$MARKER"
+            echo "## FFT autograder result"
+            echo
+            echo "**Grade: \`$grade\`** ($passed / 7 rungs passed)"
+            echo
+            echo "$summary"
+            echo
+            echo "---"
+            echo "Submissions remaining: $remaining / $MAX_SUBMISSIONS"
+            echo
+            echo "<details><summary>Full report (JSON)</summary>"
+            echo
+            echo '```json'
+            cat /tmp/grade.json
+            echo
+            echo '```'
+            echo "</details>"
+          } > /tmp/comment.md
+
+          jq -n --rawfile body /tmp/comment.md '{body: $body}' > /tmp/comment_payload.json
+          gh api -X POST "/repos/$REPO/commits/$SHA/comments" \
+            --input /tmp/comment_payload.json

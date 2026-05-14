@@ -1,0 +1,6 @@
+# Python deps for the FFT assignment. Install with:
+#     pip install -r requirements.txt
+# Requires Python 3.10+, CUDA 12.x toolkit, and an NVIDIA GPU with fp16 tensor cores.
+
+torch>=2.4
+triton>=3.6
