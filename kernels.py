@@ -162,10 +162,9 @@ def f1_launch(x_re, x_im, W_re, W_im, y_re, y_im):
     should be >= 16.
     """
     B, N = x_re.shape
-    BLOCK_M = 16
-    # BLOCK_M = min(64, next_power_of_2(B))
-    BLOCK_K = N
-    BLOCK_N = N
+    BLOCK_M = min(16, next_power_of_2(B))
+    BLOCK_K = min(N, 32)
+    BLOCK_N = min(N, 64)
     grid = (triton.cdiv(B, BLOCK_M), triton.cdiv(N, BLOCK_N))
     f1_kernel[grid](
         x_re, x_im,
@@ -226,14 +225,19 @@ def f2_kernel(
     v_re = tl.load(x_re_ptr + base + rev)
     v_im = tl.load(x_im_ptr + base + rev)
 
+    # Pre-load the full (N//2,) twiddle table once each stage
+    # gathers from registers instead of re-issuing indexed HBM loads of the same table
+    tw_table_re = tl.load(tw_re_ptr + tl.arange(0, N // 2))
+    tw_table_im = tl.load(tw_im_ptr + tl.arange(0, N // 2))
+
     # log2(N) butterfly stages
     for s in tl.static_range(LOG2_N):
         bit = 1 << s
 
         # Twiddle: w[j] = w_N^{(j & (bit-1)) * (N >> (s+1))}
         tw_idx = (idx & (bit - 1)) * (N >> (s + 1))
-        w_re = tl.load(tw_re_ptr + tw_idx)
-        w_im = tl.load(tw_im_ptr + tw_idx)
+        w_re = tl.gather(tw_table_re, tw_idx, axis=0)
+        w_im = tl.gather(tw_table_im, tw_idx, axis=0)
 
         # Partner-pair indices: bit s cleared / set
         low_idx = idx ^ (idx & bit)
