@@ -176,8 +176,8 @@ def f1_launch(x_re, x_im, W_re, W_im, y_re, y_im):
         BLOCK_M=BLOCK_M,
         BLOCK_K=BLOCK_K,
         BLOCK_N=BLOCK_N,
-        # num_warps=4,
-        # num_stages=2,
+        num_warps=4,
+        num_stages=2,
     )
 
 
@@ -283,8 +283,8 @@ def f2_launch(x_re, x_im, y_re, y_im, tw_re, tw_im, perm):
         LOG2_N=LOG2_N,
         BAILEY_EPILOGUE=False,
         STRIDED_STORE=False,
-        # num_warps=4,
-        # num_stages=2,
+        num_warps=4,
+        num_stages=2,
     )
 
 
