@@ -291,23 +291,49 @@ f6_alloc = _f67_alloc
 f7_alloc = _f67_alloc
 
 
-def f6_run(x_complex, plan, bufs):
+def _graph_run(rec_fn, x_complex, plan, bufs):
+    """Run a recursion (_f6_rec or _f7_rec) via CUDA Graph capture+replay.
+
+    The pipeline is a fixed sequence of small Triton launches with no host-
+    side branching, which is exactly the workload CUDA Graphs is designed
+    to collapse. We capture once per (plan, B) and replay on subsequent
+    calls. Input is staged into bufs['in_*'] outside the graph each call;
+    the graph reads from those fixed pointers.
+    """
     B, N = x_complex.shape
     assert N == plan['N'], f"N mismatch: x has {N}, plan has {plan['N']}"
     bufs['in_re'].copy_(x_complex.real.to(torch.float16).reshape(-1))
     bufs['in_im'].copy_(x_complex.imag.to(torch.float16).reshape(-1))
-    cyc = _Cycle(bufs, ['a', 'b', 'c'])
-    out_re, out_im = kernels._f6_rec(bufs['in_re'], bufs['in_im'], B, plan['chunks'], plan, cyc)
+
+    if plan.get('graph_B') != B:
+        # Warm pass: drives Triton JIT + any internal caches to completion
+        # so the capture pass records only kernel launches, not compiles.
+        cyc = _Cycle(bufs, ['a', 'b', 'c'])
+        rec_fn(bufs['in_re'], bufs['in_im'], B, plan['chunks'], plan, cyc)
+        torch.cuda.synchronize()
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            cyc = _Cycle(bufs, ['a', 'b', 'c'])
+            out_re, out_im = rec_fn(
+                bufs['in_re'], bufs['in_im'], B, plan['chunks'], plan, cyc,
+            )
+        plan['graph'] = g
+        plan['graph_B'] = B
+        plan['graph_out_re'] = out_re
+        plan['graph_out_im'] = out_im
+    else:
+        plan['graph'].replay()
+
+    out_re = plan['graph_out_re']
+    out_im = plan['graph_out_im']
     return torch.complex(out_re.to(torch.float32),
                          out_im.to(torch.float32)).reshape(B, N)
+
+
+def f6_run(x_complex, plan, bufs):
+    return _graph_run(kernels._f6_rec, x_complex, plan, bufs)
 
 
 def f7_run(x_complex, plan, bufs):
-    B, N = x_complex.shape
-    assert N == plan['N'], f"N mismatch: x has {N}, plan has {plan['N']}"
-    bufs['in_re'].copy_(x_complex.real.to(torch.float16).reshape(-1))
-    bufs['in_im'].copy_(x_complex.imag.to(torch.float16).reshape(-1))
-    cyc = _Cycle(bufs, ['a', 'b', 'c'])
-    out_re, out_im = kernels._f7_rec(bufs['in_re'], bufs['in_im'], B, plan['chunks'], plan, cyc)
-    return torch.complex(out_re.to(torch.float32),
-                         out_im.to(torch.float32)).reshape(B, N)
+    return _graph_run(kernels._f7_rec, x_complex, plan, bufs)
